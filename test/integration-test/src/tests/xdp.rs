@@ -1,33 +1,27 @@
-use std::{net::UdpSocket, num::NonZeroU32, time::Duration};
+use std::{ffi::CString, net::UdpSocket, num::NonZeroU32, time::Duration};
 
 use assert_matches::assert_matches;
 use aya::{
     Ebpf,
-    maps::{Array, CpuMap, XskMap},
+    maps::{Array, CpuMap, DevMap, DevMapHash, XskMap},
     programs::{ProgramError, Xdp, XdpError, XdpMode, xdp::XdpLinkId},
     util::KernelVersion,
 };
 use object::{Object as _, ObjectSection as _, ObjectSymbol as _, SymbolSection};
+use test_case::test_case;
 use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::utils::NetNsGuard;
 
-#[test_log::test]
-#[expect(
-    clippy::big_endian_bytes,
-    reason = "packet headers are encoded in network byte order"
-)]
-fn af_xdp() {
+#[test_log::test(test_case("SOCKS", "redirect_sock"; "legacy"))]
+#[test_case("SOCKS_BTF", "redirect_sock_btf"; "btf")]
+fn af_xdp(socks_name: &str, prog_name: &str) {
     let _netns = NetNsGuard::new();
 
-    let mut bpf = Ebpf::load(crate::REDIRECT).unwrap();
-    let mut socks: XskMap<_> = bpf.take_map("SOCKS").unwrap().try_into().unwrap();
+    let mut bpf = Ebpf::load(crate::XSK_MAP).unwrap();
+    let mut socks: XskMap<_> = bpf.take_map(socks_name).unwrap().try_into().unwrap();
 
-    let xdp: &mut Xdp = bpf
-        .program_mut("redirect_sock")
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let xdp: &mut Xdp = bpf.program_mut(prog_name).unwrap().try_into().unwrap();
     xdp.load().unwrap();
     xdp.attach("lo", XdpMode::default()).unwrap();
 
@@ -98,8 +92,13 @@ fn af_xdp() {
     let (udp, payload) = buf.split_at(8);
     let ports = &udp[..4];
     let (src, dst) = ports.split_at(2);
-    assert_eq!(src, port.to_be_bytes().as_slice()); // Source
-    assert_eq!(dst, 1777u16.to_be_bytes().as_slice()); // Dest
+    #[expect(
+        clippy::big_endian_bytes,
+        reason = "packet headers are encoded in network byte order"
+    )]
+    let (src_be, dst_be) = (port.to_be_bytes(), 1777u16.to_be_bytes());
+    assert_eq!(src, src_be.as_slice()); // Source
+    assert_eq!(dst, dst_be.as_slice()); // Dest
     assert_eq!(payload, b"hello AF_XDP");
 
     assert_eq!(rx.available(), 1);
@@ -160,14 +159,15 @@ fn map_load() {
     bpf.program("xdp_frags_devmap").unwrap();
 }
 
-#[test_log::test]
-fn cpumap_chain() {
+#[test_log::test(test_case("CPUS", "redirect_cpu"; "legacy"))]
+#[test_case("CPUS_BTF", "redirect_cpu_btf"; "btf")]
+fn cpumap_chain(cpus_name: &str, prog_name: &str) {
     let _netns = NetNsGuard::new();
 
-    let mut bpf = Ebpf::load(crate::REDIRECT).unwrap();
+    let mut bpf = Ebpf::load(crate::CPU_MAP).unwrap();
 
     // Load our cpumap and our canary map
-    let mut cpus: CpuMap<_> = bpf.take_map("CPUS").unwrap().try_into().unwrap();
+    let mut cpus: CpuMap<_> = bpf.take_map(cpus_name).unwrap().try_into().unwrap();
     let hits: Array<_, u32> = bpf.take_map("HITS").unwrap().try_into().unwrap();
 
     let xdp_chain_fd = {
@@ -183,7 +183,7 @@ fn cpumap_chain() {
     cpus.set(0, 2048, Some(xdp_chain_fd), 0).unwrap();
 
     // Load the main program
-    let xdp: &mut Xdp = bpf.program_mut("redirect_cpu").unwrap().try_into().unwrap();
+    let xdp: &mut Xdp = bpf.program_mut(prog_name).unwrap().try_into().unwrap();
     xdp.load().unwrap();
     let result = xdp.attach("lo", XdpMode::default());
     // Generic devices did not support cpumap XDP programs until 5.15.
@@ -216,4 +216,70 @@ fn cpumap_chain() {
     assert_eq!(&buf[..n], PAYLOAD.as_bytes());
     assert_eq!(hits.get(&0, 0).unwrap(), 1);
     assert_eq!(hits.get(&1, 0).unwrap(), 1);
+}
+
+#[test_log::test(test_case(
+    "DEVS", "DEVS_HASH",
+    "redirect_dev", "redirect_dev_hash",
+    "get_dev", "get_dev_hash";
+    "legacy"
+))]
+#[test_case(
+    "DEVS_BTF", "DEVS_HASH_BTF",
+    "redirect_dev_btf", "redirect_dev_hash_btf",
+    "get_dev_btf", "get_dev_hash_btf";
+    "btf"
+)]
+fn devmap_set(
+    devs_name: &str,
+    devs_hash_name: &str,
+    dev_prog: &str,
+    dev_hash_prog: &str,
+    dev_get_prog: &str,
+    dev_hash_get_prog: &str,
+) {
+    let _netns = NetNsGuard::new();
+
+    let mut bpf = Ebpf::load(crate::DEV_MAP).unwrap();
+    let mut devs: DevMap<_> = bpf.take_map(devs_name).unwrap().try_into().unwrap();
+    let mut devs_hash: DevMapHash<_> = bpf.take_map(devs_hash_name).unwrap().try_into().unwrap();
+
+    let lo = {
+        let name = CString::new("lo").unwrap();
+        let idx = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        assert!(idx != 0, "interface `lo` not found");
+        idx
+    };
+    devs.set(0, lo, None, 0).unwrap();
+    devs_hash.insert(10, lo, None, 0).unwrap();
+
+    // Load each probe so the BPF verifier validates the wrapper-generated
+    // bytecode. `redirect` works on every kernel that supports the map type;
+    // `get` reads `bpf_devmap_val::bpf_prog.id` so it requires 5.8+.
+    for prog in [dev_prog, dev_hash_prog] {
+        let xdp: &mut Xdp = bpf.program_mut(prog).unwrap().try_into().unwrap();
+        xdp.load().unwrap();
+    }
+    let kernel_version = KernelVersion::current().unwrap();
+    if kernel_version < KernelVersion::new(5, 8, 0) {
+        eprintln!(
+            "skipping {dev_get_prog} and {dev_hash_get_prog} on kernel {kernel_version:?}, bpf_devmap_val was added in 5.8; see https://github.com/torvalds/linux/commit/fbee97feed9b"
+        );
+        return;
+    }
+    for prog in [dev_get_prog, dev_hash_get_prog] {
+        let xdp: &mut Xdp = bpf.program_mut(prog).unwrap().try_into().unwrap();
+        xdp.load().unwrap();
+    }
+}
+
+#[test_log::test(test_case("get_ifindex_dev"; "legacy_array"))]
+#[test_case("get_ifindex_dev_hash"; "legacy_hash")]
+#[test_case("get_ifindex_dev_btf"; "btf_array")]
+#[test_case("get_ifindex_dev_hash_btf"; "btf_hash")]
+fn devmap_get_ifindex(prog_name: &str) {
+    let _netns = NetNsGuard::new();
+    let mut bpf = Ebpf::load(crate::DEV_MAP).unwrap();
+    let xdp: &mut Xdp = bpf.program_mut(prog_name).unwrap().try_into().unwrap();
+    xdp.load().unwrap();
 }
